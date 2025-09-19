@@ -39,7 +39,6 @@ export default function NetworkSimulator() {
 
   const canvasRef = useRef(null);
   const [cellSize, setCellSize] = useState(12); // px per cell (affects grid resolution via resampling)
-  const [suppressResetOnResize, setSuppressResetOnResize] = useState(false);
   const [zoom, setZoom] = useState(1);
 
   // visual state
@@ -60,14 +59,7 @@ export default function NetworkSimulator() {
   const [selectionStart, setSelectionStart] = useState(null); // {r,c}
   const [snapToNetwork, setSnapToNetwork] = useState(false);
 
-  useEffect(() => {
-    if (suppressResetOnResize) return;
-    setGrid(createEmptyGrid(rows, cols));
-    setPoiMap({});
-    setStart(null);
-    setSolutionPaths([]);
-    setTrialPaths([]);
-  }, [rows, cols, suppressResetOnResize]);
+  // Removed auto-reset on rows/cols change to preserve POIs/Start during resampling
 
   
 
@@ -671,16 +663,76 @@ export default function NetworkSimulator() {
       newStart = { r: nr, c: nc };
       newGrid[nr][nc] = 2;
     }
-    setSuppressResetOnResize(true);
-    setRows(rowsNew);
-    setCols(colsNew);
+    // batch updates in a single tick to avoid intermediate effects
     setGrid(newGrid);
     setPoiMap(mapPoi);
     setStart(newStart);
+    setRows(rowsNew);
+    setCols(colsNew);
     setCellSize(newCellSize);
     setSolutionPaths([]);
     setTrialPaths([]);
-    setTimeout(()=>setSuppressResetOnResize(false), 0);
+  }
+
+  // Export / Import
+  function exportScenario() {
+    const data = {
+      rows,
+      cols,
+      cellSize,
+      zoom,
+      grid,
+      poiMap,
+      start,
+      settings: {
+        trials,
+        showTrials,
+        trialOpacity,
+        animateGrowth,
+        allowDiagonals,
+        trialsInfluence,
+        noiseScale,
+      },
+    };
+    const json = JSON.stringify(data);
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'scenario.json';
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function importScenarioFromFile(file) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const data = JSON.parse(reader.result);
+        if (!data || !data.grid || !Array.isArray(data.grid)) throw new Error('Invalid file');
+        setGrid(data.grid);
+        setRows(data.rows);
+        setCols(data.cols);
+        if (typeof data.cellSize === 'number') setCellSize(data.cellSize);
+        if (typeof data.zoom === 'number') setZoom(data.zoom);
+        setPoiMap(data.poiMap || {});
+        setStart(data.start || null);
+        if (data.settings) {
+          if (typeof data.settings.trials === 'number') setTrials(data.settings.trials);
+          if (typeof data.settings.showTrials === 'boolean') setShowTrials(data.settings.showTrials);
+          if (typeof data.settings.trialOpacity === 'number') setTrialOpacity(data.settings.trialOpacity);
+          if (typeof data.settings.animateGrowth === 'boolean') setAnimateGrowth(data.settings.animateGrowth);
+          if (typeof data.settings.allowDiagonals === 'boolean') setAllowDiagonals(data.settings.allowDiagonals);
+          if (typeof data.settings.trialsInfluence === 'number') setTrialsInfluence(data.settings.trialsInfluence);
+          if (typeof data.settings.noiseScale === 'number') setNoiseScale(data.settings.noiseScale);
+        }
+        setSolutionPaths([]);
+        setTrialPaths([]);
+      } catch (e) {
+        alert('Failed to import scenario: ' + e.message);
+      }
+    };
+    reader.readAsText(file);
   }
 
   // Map screen event to grid cell considering zoom
@@ -774,6 +826,13 @@ export default function NetworkSimulator() {
                 <span className="text-xs text-gray-600">{Math.round(zoom*100)}%</span>
               </div>
             </div>
+          <div className="mt-2 flex gap-2">
+            <button className="px-3 py-1 bg-blue-600 text-white rounded" onClick={exportScenario}>Export</button>
+            <label className="px-3 py-1 bg-gray-100 border rounded cursor-pointer">
+              Import
+              <input type="file" accept="application/json" className="hidden" onChange={(e)=>{ const f=e.target.files?.[0]; if(f) importScenarioFromFile(f); e.target.value=''; }} />
+            </label>
+          </div>
           </div>
 
           <div className="mb-3">
