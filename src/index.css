@@ -1,0 +1,10 @@
+@import "tailwindcss";
+
+/* Keep styles minimal; let Tailwind control theme */
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background: #f8fafc; /* slate-50 */
+  color: #0f172a; /* slate-900 */
+}
