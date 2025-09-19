@@ -27,6 +27,7 @@ export default function NetworkSimulator() {
 
   // drawing
   const [mode, setMode] = useState("wall"); // wall, erase, poi, start
+  // modes also support 'select'
   const [poiSize, setPoiSize] = useState(3);
   const [selectedPoiColor, setSelectedPoiColor] = useState("#ff7f50");
 
@@ -37,21 +38,36 @@ export default function NetworkSimulator() {
   const [animateGrowth, setAnimateGrowth] = useState(true);
 
   const canvasRef = useRef(null);
-  const cellSize = 16; // px
+  const [cellSize, setCellSize] = useState(12); // px per cell (affects grid resolution via resampling)
+  const [suppressResetOnResize, setSuppressResetOnResize] = useState(false);
+  const [zoom, setZoom] = useState(1);
 
   // visual state
   const [solutionPaths, setSolutionPaths] = useState([]); // final path cells set
   const [trialPaths, setTrialPaths] = useState([]); // array of path sets
   const [isSimulating, setIsSimulating] = useState(false);
   const [isMouseDown, setIsMouseDown] = useState(false);
+  const [pushedHistoryThisDrag, setPushedHistoryThisDrag] = useState(false);
+  const [allowDiagonals, setAllowDiagonals] = useState(false);
+  const [trialsInfluence, setTrialsInfluence] = useState(0.5); // 0..1 strength
+  const [noiseScale, setNoiseScale] = useState(0.7); // affects trial variability
+
+  // undo/redo history
+  const [history, setHistory] = useState([]); // stack of snapshots
+  const [future, setFuture] = useState([]);
+
+  // selection tool
+  const [selectionStart, setSelectionStart] = useState(null); // {r,c}
+  const [snapToNetwork, setSnapToNetwork] = useState(false);
 
   useEffect(() => {
+    if (suppressResetOnResize) return;
     setGrid(createEmptyGrid(rows, cols));
     setPoiMap({});
     setStart(null);
     setSolutionPaths([]);
     setTrialPaths([]);
-  }, [rows, cols]);
+  }, [rows, cols, suppressResetOnResize]);
 
   
 
@@ -60,12 +76,11 @@ export default function NetworkSimulator() {
   }
 
   function handleCanvasClick(e) {
-    const rect = canvasRef.current.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-    const c = Math.floor(x / cellSize);
-    const r = Math.floor(y / cellSize);
+    pushHistoryOnce();
+    const { r, c } = getCellFromEvent(e);
     if (r < 0 || r >= rows || c < 0 || c >= cols) return;
+
+    if (mode === "select") { return; }
 
     if (mode === "wall") {
       const g = createGridCopy(grid);
@@ -84,9 +99,14 @@ export default function NetworkSimulator() {
       setGrid(g);
     } else if (mode === "poi") {
       const g = createGridCopy(grid);
-      g[r][c] = 3;
-      const key = `${r}_${c}`;
-      setPoiMap({ ...poiMap, [key]: { r, c, size: poiSize, color: selectedPoiColor } });
+      let pr = r, pc = c;
+      if (snapToNetwork && solutionPaths.length > 0) {
+        const nearest = findNearestNetworkCell(r, c, solutionPaths);
+        if (nearest) { pr = nearest.r; pc = nearest.c; }
+      }
+      g[pr][pc] = 3;
+      const key = `${pr}_${pc}`;
+      setPoiMap({ ...poiMap, [key]: { r: pr, c: pc, size: poiSize, color: selectedPoiColor } });
       setGrid(g);
     } else if (mode === "start") {
       const g = createGridCopy(grid);
@@ -94,24 +114,29 @@ export default function NetworkSimulator() {
       if (start) {
         g[start.r][start.c] = 0;
       }
-      g[r][c] = 2;
-      setStart({ r, c });
+      let sr = r, sc = c;
+      if (snapToNetwork && solutionPaths.length > 0) {
+        const nearest = findNearestNetworkCell(r, c, solutionPaths);
+        if (nearest) { sr = nearest.r; sc = nearest.c; }
+      }
+      g[sr][sc] = 2;
+      setStart({ r: sr, c: sc });
       setGrid(g);
     }
   }
 
   function handlePointerDown(e) {
     setIsMouseDown(true);
+    setPushedHistoryThisDrag(false);
     if (mode === 'poi' || mode === 'start') {
+      pushHistoryOnce();
       handleCanvasClick(e);
       return;
     }
-    const rect = canvasRef.current.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-    const c = Math.floor(x / cellSize);
-    const r = Math.floor(y / cellSize);
+    const { r, c } = getCellFromEvent(e);
     if (r < 0 || r >= rows || c < 0 || c >= cols) return;
+    if (mode === 'select') { setSelectionStart({ r, c }); return; }
+    pushHistoryOnce();
     if (mode === 'wall') {
       const g = createGridCopy(grid);
       if (g[r][c] !== 1) { g[r][c] = 1; setGrid(g); }
@@ -131,11 +156,7 @@ export default function NetworkSimulator() {
   function handlePointerMove(e) {
     if (!isMouseDown) return;
     if (mode !== 'wall' && mode !== 'erase') return;
-    const rect = canvasRef.current.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-    const c = Math.floor(x / cellSize);
-    const r = Math.floor(y / cellSize);
+    const { r, c } = getCellFromEvent(e);
     if (r < 0 || r >= rows || c < 0 || c >= cols) return;
     if (mode === 'wall') {
       if (grid[r][c] === 1) return;
@@ -159,13 +180,70 @@ export default function NetworkSimulator() {
 
   function handlePointerUp() {
     setIsMouseDown(false);
+    setPushedHistoryThisDrag(false);
+  }
+
+  function pushHistoryOnce() {
+    if (pushedHistoryThisDrag) return;
+    const snapshot = {
+      grid: createGridCopy(grid),
+      poiMap: { ...poiMap },
+      start: start ? { ...start } : null,
+      rows, cols,
+    };
+    setHistory((h)=>[...h, snapshot]);
+    setFuture([]);
+    setPushedHistoryThisDrag(true);
+  }
+
+  function undo() {
+    if (history.length === 0) return;
+    const last = history[history.length-1];
+    const current = {
+      grid: createGridCopy(grid),
+      poiMap: { ...poiMap },
+      start: start ? { ...start } : null,
+      rows, cols,
+    };
+    setFuture((f)=>[...f, current]);
+    setHistory((h)=>h.slice(0, -1));
+    setGrid(createGridCopy(last.grid));
+    setPoiMap({ ...last.poiMap });
+    setStart(last.start ? { ...last.start } : null);
+    if (last.rows !== rows || last.cols !== cols) {
+      setRows(last.rows);
+      setCols(last.cols);
+    }
+  }
+
+  function redo() {
+    if (future.length === 0) return;
+    const next = future[future.length-1];
+    const current = {
+      grid: createGridCopy(grid),
+      poiMap: { ...poiMap },
+      start: start ? { ...start } : null,
+      rows, cols,
+    };
+    setHistory((h)=>[...h, current]);
+    setFuture((f)=>f.slice(0, -1));
+    setGrid(createGridCopy(next.grid));
+    setPoiMap({ ...next.poiMap });
+    setStart(next.start ? { ...next.start } : null);
+    if (next.rows !== rows || next.cols !== cols) {
+      setRows(next.rows);
+      setCols(next.cols);
+    }
   }
 
   const drawCanvas = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
+    // Physical size equals rows*cellSize x cols*cellSize (grid expands/shrinks with resolution)
     canvas.width = cols * cellSize;
     canvas.height = rows * cellSize;
+    canvas.style.width = `${cols * cellSize * zoom}px`;
+    canvas.style.height = `${rows * cellSize * zoom}px`;
     const ctx = canvas.getContext("2d");
 
     // If grid hasn't been resized to match rows/cols yet, skip this frame
@@ -217,6 +295,15 @@ export default function NetworkSimulator() {
       ctx.font = "10px sans-serif";
       ctx.fillText(p.size, cx - 3, cy + 3);
     });
+
+    // draw selection highlight (single-cell for now)
+    if (mode === 'select' && selectionStart) {
+      const sx = selectionStart.c * cellSize;
+      const sy = selectionStart.r * cellSize;
+      ctx.strokeStyle = '#0ea5e9'; // sky-500
+      ctx.lineWidth = 2;
+      ctx.strokeRect(sx + 1, sy + 1, cellSize - 2, cellSize - 2);
+    }
 
     // draw start
     if (start) {
@@ -297,7 +384,7 @@ export default function NetworkSimulator() {
       ctx.lineTo(c * cellSize + 0.5, rows * cellSize);
       ctx.stroke();
     }
-  }, [cols, rows, grid, poiMap, start, trialPaths, solutionPaths, trialOpacity, cellSize]);
+  }, [cols, rows, grid, poiMap, start, trialPaths, solutionPaths, trialOpacity, cellSize, mode, selectionStart, zoom]);
 
   useEffect(() => {
     drawCanvas();
@@ -327,7 +414,7 @@ export default function NetworkSimulator() {
       const keyFor = (r, c) => `${r}_${c}`;
       const open = new MinHeap((a, b) => a.f - b.f);
       const startNode = { r: s.r, c: s.c, g: 0, f: 0, prev: null };
-      startNode.f = heuristic(s, t);
+      startNode.f = heuristic(s, t, allowDiagonals);
       open.push(startNode);
       const closed = new Map();
 
@@ -346,13 +433,13 @@ export default function NetworkSimulator() {
           }
           return path.reverse();
         }
-        const neighs = neighbors(cur.r, cur.c, rows, cols);
+        const neighs = neighbors(cur.r, cur.c, rows, cols, allowDiagonals, grid);
         for (const n of neighs) {
           if (grid[n.r][n.c] === 1) continue; // wall
           const nKey = keyFor(n.r, n.c);
           if (closed.has(nKey)) continue;
-          // base cost 1; add extra cost inversely proportional to POI attraction
-          let moveCost = 1;
+          // base cost: 1 for orthogonal, sqrt(2) for diagonal
+          let moveCost = (n.dr && n.dc) ? Math.SQRT2 : 1;
           // cells near big POIs are slightly cheaper to encourage passing near them
           Object.values(poiMap).forEach((poi) => {
             const dist = Math.abs(poi.r - n.r) + Math.abs(poi.c - n.c);
@@ -366,12 +453,12 @@ export default function NetworkSimulator() {
           // noise to produce different trials
           if (noiseSeed !== 0) {
             // deterministic-ish noise from seed and coords
-            const noise = pseudoRandomHash(n.r, n.c, noiseSeed) * 0.7;
+            const noise = pseudoRandomHash(n.r, n.c, noiseSeed) * noiseScale;
             moveCost *= 1 + noise;
           }
 
           const gscore = cur.g + moveCost;
-          const fscore = gscore + heuristic(n, t);
+          const fscore = gscore + heuristic(n, t, allowDiagonals);
           open.push({ r: n.r, c: n.c, g: gscore, f: fscore, prev: cur });
         }
       }
@@ -380,7 +467,7 @@ export default function NetworkSimulator() {
     }
 
     // runs one trial and returns union of MST paths cells
-    function runOneTrial(seed = 0) {
+    function runOneTrial(seed = 0, computePathFn = computeAstarPath) {
       // 1) compute pairwise shortest paths between terminals
       const n = terminals.length;
       const pairPaths = {}; // key i_j -> path
@@ -389,7 +476,7 @@ export default function NetworkSimulator() {
         for (let j = i + 1; j < n; j++) {
           const s = terminals[i];
           const t = terminals[j];
-          const path = computeAstarPath(s, t, seed);
+          const path = computePathFn(s, t, seed);
           if (!path) {
             distMat[i][j] = distMat[j][i] = Infinity;
           } else {
@@ -449,8 +536,65 @@ export default function NetworkSimulator() {
       }
     }
 
-    // compute final deterministic solution (seed 0)
-    const final = runOneTrial(0);
+    // Build a heatmap from trials to bias final A*
+    const heat = Array.from({ length: rows }, () => Array(cols).fill(0));
+    if (allTrials.length > 0) {
+      const norm = 1 / allTrials.length;
+      allTrials.forEach((t) => {
+        t.cells.forEach(({ r, c }) => {
+          if (r>=0 && r<rows && c>=0 && c<cols) heat[r][c] += norm;
+        });
+      });
+    }
+    // Biased A* that uses the heatmap
+    function computeAstarPathBiased(s, t, noiseSeed = 0) {
+      const keyFor = (r, c) => `${r}_${c}`;
+      const open = new MinHeap((a, b) => a.f - b.f);
+      const startNode = { r: s.r, c: s.c, g: 0, f: 0, prev: null };
+      startNode.f = heuristic(s, t, allowDiagonals);
+      open.push(startNode);
+      const closed = new Map();
+      while (!open.isEmpty()) {
+        const cur = open.pop();
+        const curKey = keyFor(cur.r, cur.c);
+        if (closed.has(curKey)) continue;
+        closed.set(curKey, cur);
+        if (cur.r === t.r && cur.c === t.c) {
+          const path = [];
+          let p = cur;
+          while (p) { path.push({ r: p.r, c: p.c }); p = p.prev; }
+          return path.reverse();
+        }
+        const neighs = neighbors(cur.r, cur.c, rows, cols, allowDiagonals, grid);
+        for (const n of neighs) {
+          if (grid[n.r][n.c] === 1) continue;
+          const nKey = keyFor(n.r, n.c);
+          if (closed.has(nKey)) continue;
+          let moveCost = (n.dr && n.dc) ? Math.SQRT2 : 1;
+          // attraction
+          Object.values(poiMap).forEach((poi) => {
+            const dist = Math.abs(poi.r - n.r) + Math.abs(poi.c - n.c);
+            const radius = Math.max(1, Math.floor(poi.size * 3));
+            if (dist <= radius) moveCost *= 0.9 - Math.min(0.35, poi.size * 0.02);
+          });
+          // trial heat bias: prefer cells frequently seen in trials (reduce cost up to trialsInfluence)
+          const h = heat[n.r][n.c]; // 0..1
+          const bias = 1 - trialsInfluence * h * 0.5; // reduce up to 50% * influence
+          moveCost *= Math.max(0.5, bias);
+          if (noiseSeed !== 0) {
+            const noise = pseudoRandomHash(n.r, n.c, noiseSeed) * noiseScale;
+            moveCost *= 1 + noise;
+          }
+          const gscore = cur.g + moveCost;
+          const fscore = gscore + heuristic(n, t, allowDiagonals);
+          open.push({ r: n.r, c: n.c, g: gscore, f: fscore, prev: cur });
+        }
+      }
+      return null;
+    }
+
+    // compute final heat-biased solution using runOneTrial with custom compute
+    const final = runOneTrial(0, computeAstarPathBiased);
     setSolutionPaths(final.arrays);
 
     // optionally animate growth by drawing incremental segments
@@ -482,6 +626,7 @@ export default function NetworkSimulator() {
 
   // utility: clear everything
   function clearAll() {
+    pushHistoryOnce();
     setGrid(createEmptyGrid(rows, cols));
     setPoiMap({});
     setStart(null);
@@ -491,6 +636,7 @@ export default function NetworkSimulator() {
 
   // helper UI actions for POIs
   function removePoiAt(key) {
+    pushHistoryOnce();
     const pm = { ...poiMap };
     delete pm[key];
     setPoiMap(pm);
@@ -498,6 +644,55 @@ export default function NetworkSimulator() {
     const g = createGridCopy(grid);
     if (g[r][c] === 3) g[r][c] = 0;
     setGrid(g);
+  }
+
+  // Adjust grid resolution to keep physical extent constant when cell size changes
+  function resampleResolution(newCellSize) {
+    if (newCellSize === cellSize) return;
+    const rowsOld = rows;
+    const colsOld = cols;
+    // keep physical height/width approximately constant: rows*cell ~ const
+    const rowsNew = Math.max(6, Math.round((rowsOld * cellSize) / newCellSize));
+    const colsNew = Math.max(6, Math.round((colsOld * cellSize) / newCellSize));
+    // resample grid
+    const newGrid = resampleGrid(grid, rowsOld, colsOld, rowsNew, colsNew);
+    // remap POIs and start by proportional coordinates
+    const mapPoi = {};
+    Object.values(poiMap).forEach((p) => {
+      const nr = Math.min(rowsNew - 1, Math.round(p.r * rowsNew / rowsOld));
+      const nc = Math.min(colsNew - 1, Math.round(p.c * colsNew / colsOld));
+      mapPoi[`${nr}_${nc}`] = { ...p, r: nr, c: nc };
+      newGrid[nr][nc] = 3;
+    });
+    let newStart = null;
+    if (start) {
+      const nr = Math.min(rowsNew - 1, Math.round(start.r * rowsNew / rowsOld));
+      const nc = Math.min(colsNew - 1, Math.round(start.c * colsNew / colsOld));
+      newStart = { r: nr, c: nc };
+      newGrid[nr][nc] = 2;
+    }
+    setSuppressResetOnResize(true);
+    setRows(rowsNew);
+    setCols(colsNew);
+    setGrid(newGrid);
+    setPoiMap(mapPoi);
+    setStart(newStart);
+    setCellSize(newCellSize);
+    setSolutionPaths([]);
+    setTrialPaths([]);
+    setTimeout(()=>setSuppressResetOnResize(false), 0);
+  }
+
+  // Map screen event to grid cell considering zoom
+  function getCellFromEvent(e) {
+    const rect = canvasRef.current.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    const displayedWidth = cols * cellSize * zoom;
+    const displayedHeight = rows * cellSize * zoom;
+    const c = Math.floor((x / displayedWidth) * cols);
+    const r = Math.floor((y / displayedHeight) * rows);
+    return { r, c };
   }
 
   return (
@@ -519,6 +714,7 @@ export default function NetworkSimulator() {
               <button className={`py-1 px-2 rounded ${mode==='erase'? 'bg-indigo-600 text-white' : 'bg-gray-100'}`} onClick={()=>setMode('erase')}>Erase</button>
               <button className={`py-1 px-2 rounded ${mode==='poi'? 'bg-indigo-600 text-white' : 'bg-gray-100'}`} onClick={()=>setMode('poi')}>Place POI</button>
               <button className={`py-1 px-2 rounded ${mode==='start'? 'bg-indigo-600 text-white' : 'bg-gray-100'}`} onClick={()=>setMode('start')}>Place Start</button>
+              <button className={`py-1 px-2 rounded ${mode==='select'? 'bg-indigo-600 text-white' : 'bg-gray-100'}`} onClick={()=>setMode('select')}>Select</button>
             </div>
             <div className="mt-2">
               <label className="block text-sm">POI size</label>
@@ -526,6 +722,10 @@ export default function NetworkSimulator() {
               <div className="flex items-center mt-1 gap-2">
                 <input value={selectedPoiColor} onChange={(e)=>setSelectedPoiColor(e.target.value)} type="color" />
                 <div className="text-sm">Current color</div>
+              </div>
+              <div className="mt-2 flex items-center gap-2">
+                <input id="snapToNetwork" type="checkbox" checked={snapToNetwork} onChange={(e)=>setSnapToNetwork(e.target.checked)} />
+                <label htmlFor="snapToNetwork" className="text-sm">Snap placement to nearest network</label>
               </div>
             </div>
           </div>
@@ -535,6 +735,15 @@ export default function NetworkSimulator() {
             <div className="flex gap-2 mt-2">
               <label className="text-sm">Trials</label>
               <input type="number" value={trials} onChange={(e)=>setTrials(clamp(Number(e.target.value), 1, 200))} className="w-20 border p-1 rounded" />
+            </div>
+            <div className="flex gap-2 mt-2 items-center">
+              <label className="text-sm">Cell size</label>
+              <input type="range" min={6} max={24} step={1} value={cellSize} onChange={(e)=>resampleResolution(Number(e.target.value))} className="w-full" />
+              <span className="text-xs text-gray-600">{cellSize}px</span>
+            </div>
+            <div className="flex gap-2 mt-2 items-center">
+              <label className="text-sm">Noise</label>
+              <input type="range" min={0} max={1} step={0.05} value={noiseScale} onChange={(e)=>setNoiseScale(Number(e.target.value))} className="w-full" />
             </div>
             <div className="mt-2 flex items-center gap-2">
               <input id="showTrials" type="checkbox" checked={showTrials} onChange={(e)=>setShowTrials(e.target.checked)} />
@@ -548,10 +757,22 @@ export default function NetworkSimulator() {
               <input id="animateGrowth" type="checkbox" checked={animateGrowth} onChange={(e)=>setAnimateGrowth(e.target.checked)} />
               <label htmlFor="animateGrowth" className="text-sm">Animate growth</label>
             </div>
-
+            <div className="mt-2 flex items-center gap-2">
+              <input id="allowDiagonals" type="checkbox" checked={allowDiagonals} onChange={(e)=>setAllowDiagonals(e.target.checked)} />
+              <label htmlFor="allowDiagonals" className="text-sm">Allow diagonals</label>
+            </div>
+            <div className="mt-3 flex gap-2">
+              <button className="px-3 py-1 bg-gray-100 border rounded" onClick={undo}>Undo</button>
+              <button className="px-3 py-1 bg-gray-100 border rounded" onClick={redo}>Redo</button>
+            </div>
             <div className="mt-3 flex gap-2">
               <button className="px-3 py-1 bg-green-600 text-white rounded" onClick={runSimulation} disabled={isSimulating}>{isSimulating? 'Simulating...' : 'Simulate'}</button>
               <button className="px-3 py-1 bg-gray-200 rounded" onClick={clearAll}>Clear</button>
+              <div className="ml-auto flex items-center gap-2">
+                <label className="text-sm">Zoom</label>
+                <input type="range" min={0.5} max={2} step={0.1} value={zoom} onChange={(e)=>setZoom(Number(e.target.value))} />
+                <span className="text-xs text-gray-600">{Math.round(zoom*100)}%</span>
+              </div>
             </div>
           </div>
 
@@ -574,6 +795,12 @@ export default function NetworkSimulator() {
             </div>
           </div>
 
+          <div className="mb-3">
+            <label className="block text-sm">Trials influence final</label>
+            <input type="range" min={0} max={1} step={0.05} value={trialsInfluence} onChange={(e)=>setTrialsInfluence(Number(e.target.value))} className="w-full" />
+            <div className="text-xs text-gray-600 mt-1">Higher = final prefers frequently used trial cells</div>
+          </div>
+
           <div className="text-xs text-gray-600">How it finds the most efficient route: it combines A* (shortest-grid paths) with an MST computed on the terminals (start + POIs). POI size influences local path cost creating attraction. Trials add small noise so you can visualize plausible alternatives. Final route is deterministic.</div>
         </div>
 
@@ -594,6 +821,9 @@ export default function NetworkSimulator() {
               onMouseUp={handlePointerUp}
               onMouseLeave={handlePointerUp}
             />
+            {mode==='select' && selectionStart && (
+              <div className="p-2 text-xs text-slate-600">Selected cell: ({selectionStart.r},{selectionStart.c})</div>
+            )}
           </div>
         </div>
       </div>
@@ -609,17 +839,59 @@ function createEmptyGrid(r, c) {
 
 function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
 
-function heuristic(a, b) {
-  // Manhattan
-  return Math.abs(a.r - b.r) + Math.abs(a.c - b.c);
+// Resample grid resolution by adjusting rows/cols proportionally to cell size change,
+// preserving physical extent (rows*cellSize, cols*cellSize ~ constant) and content by nearest-neighbor
+function resampleGrid(grid, rowsOld, colsOld, rowsNew, colsNew) {
+  const out = createEmptyGrid(rowsNew, colsNew);
+  for (let r = 0; r < rowsNew; r++) {
+    const srcR = Math.min(rowsOld - 1, Math.floor(r * rowsOld / rowsNew));
+    for (let c = 0; c < colsNew; c++) {
+      const srcC = Math.min(colsOld - 1, Math.floor(c * colsOld / colsNew));
+      out[r][c] = grid[srcR][srcC];
+    }
+  }
+  return out;
 }
 
-function neighbors(r, c, rows, cols) {
+function heuristic(a, b, allowDiagonals=false) {
+  if (!allowDiagonals) {
+    // Manhattan
+    return Math.abs(a.r - b.r) + Math.abs(a.c - b.c);
+  }
+  // Octile distance for 8-connected grids
+  const dr = Math.abs(a.r - b.r);
+  const dc = Math.abs(a.c - b.c);
+  const dmin = Math.min(dr, dc);
+  const dmax = Math.max(dr, dc);
+  return dmin * Math.SQRT2 + (dmax - dmin) * 1;
+}
+
+function neighbors(r, c, rows, cols, allowDiagonals=false, grid=null) {
   const out = [];
-  if (r > 0) out.push({ r: r-1, c });
-  if (r < rows-1) out.push({ r: r+1, c });
-  if (c > 0) out.push({ r, c: c-1 });
-  if (c < cols-1) out.push({ r, c: c+1 });
+  // orthogonal
+  if (r > 0) out.push({ r: r-1, c, dr: -1, dc: 0 });
+  if (r < rows-1) out.push({ r: r+1, c, dr: 1, dc: 0 });
+  if (c > 0) out.push({ r, c: c-1, dr: 0, dc: -1 });
+  if (c < cols-1) out.push({ r, c: c+1, dr: 0, dc: 1 });
+  if (!allowDiagonals) return out;
+  // diagonals with corner-cutting prevention
+  const tryAddDiag = (nr, nc, br, bc) => {
+    if (nr < 0 || nr >= rows || nc < 0 || nc >= cols) return;
+    if (!grid) return;
+    // prevent cutting corners through walls: block if either adjacent orthogonal is a wall
+    const blockVertical = br;
+    const blockHorizontal = bc;
+    if (grid[r][blockHorizontal] === 1 || grid[blockVertical][c] === 1) return;
+    out.push({ r: nr, c: nc, dr: nr - r, dc: nc - c });
+  };
+  // up-left
+  tryAddDiag(r-1, c-1, r-1, c-1);
+  // up-right
+  tryAddDiag(r-1, c+1, r-1, c+1);
+  // down-left
+  tryAddDiag(r+1, c-1, r+1, c-1);
+  // down-right
+  tryAddDiag(r+1, c+1, r+1, c+1);
   return out;
 }
 
@@ -638,6 +910,19 @@ function chunkArray(arr, size){
   const out = [];
   for (let i=0;i<arr.length;i+=size) out.push(arr.slice(i, i+size));
   return out;
+}
+
+// find nearest cell along existing solution paths
+function findNearestNetworkCell(r, c, solutionPaths){
+  let best = null;
+  let bestDist = Infinity;
+  for (const path of solutionPaths) {
+    for (const cell of path) {
+      const d = Math.abs(cell.r - r) + Math.abs(cell.c - c);
+      if (d < bestDist) { bestDist = d; best = cell; }
+    }
+  }
+  return best;
 }
 
 // simple deterministic pseudo-random hash used for noise
